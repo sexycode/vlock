@@ -52,7 +52,140 @@ static const char *auth_failure_blurb =
 
 static int auth_tries;
 
+#define CTRL(x) ((x) & 0x1f)
+
+typedef enum {
+  STATE_LOCK,
+  STATE_AUTH
+} lock_state_t;
+
 static void auth_loop(const char *username)
+{
+  GError *err = NULL;
+  struct timespec *prompt_timeout;
+  struct timespec *wait_timeout;
+  char *vlock_message;
+  const char *auth_names[] = { username, "root", NULL };
+  lock_state_t state = STATE_LOCK;
+
+#ifndef NO_ROOT_PASS
+  if (strcmp(username, "root") == 0)
+#endif
+  auth_names[1] = NULL;
+
+  /* Get messages */
+  vlock_message = getenv("VLOCK_MESSAGE");
+  if (vlock_message == NULL) {
+    if (console_switch_locked)
+      vlock_message = getenv("VLOCK_ALL_MESSAGE");
+    else
+      vlock_message = getenv("VLOCK_CURRENT_MESSAGE");
+  }
+
+  /* Timeouts */
+  prompt_timeout = parse_seconds(getenv("VLOCK_PROMPT_TIMEOUT"));
+#ifdef USE_PLUGINS
+  wait_timeout = parse_seconds(getenv("VLOCK_TIMEOUT"));
+#else
+  wait_timeout = NULL;
+#endif
+
+  for (;;) {
+
+    /* ================= LOCK STATE ================= */
+    while (state == STATE_LOCK) {
+      char c;
+
+      if (vlock_message && *vlock_message) {
+        fputs(vlock_message, stderr);
+        fputc('\n', stderr);
+      }
+
+      c = wait_for_character("\n\033\f\003", wait_timeout, NULL);
+
+      /* Ctrl+L → AUTH */
+      if (c == CTRL('L')) {
+        fputs("너 누구냐\n", stderr);
+        state = STATE_AUTH;
+        break;
+      }
+
+#if 0
+	  if (c == '\n') {
+		  fprintf(stderr, "\033[H\033[2J"); // 화면 초기화
+		  fprintf(stderr, "엔터누르지 마라\n");
+		  fflush(stderr);
+		  continue;
+	  }
+
+#else
+      if (c == CTRL('c')) {
+        fputs("왜 중지하게? ㅋ\n", stderr);
+		fflush(stderr);
+		sleep(1);
+        continue;
+	  }
+
+      /* Enter → just redraw message */
+      if (c == '\n') {
+        fputs("엔터누르지 마라\n", stderr);
+		fflush(stderr);
+		sleep(1);
+        continue;
+	  }
+#endif
+      /* ESC / timeout → stay locked */
+#ifdef USE_PLUGINS
+      if (c == '\033' || c == 0) {
+        plugin_hook("vlock_save");
+        c = wait_for_character(NULL, NULL, NULL);
+        plugin_hook("vlock_save_abort");
+        continue;
+      }
+#endif
+    }
+
+    /* ================= AUTH STATE ================= */
+    if (state == STATE_AUTH) {
+      for (size_t i = 0; auth_names[i] != NULL; i++) {
+
+        if (auth(auth_names[i], prompt_timeout, &err))
+          goto auth_success;
+
+        g_assert(err != NULL);
+
+        if (g_error_matches(err,
+                            VLOCK_PROMPT_ERROR,
+                            VLOCK_PROMPT_ERROR_TIMEOUT)) {
+          fprintf(stderr, "Timeout!\n");
+        } else {
+          fprintf(stderr, "vlock: %s\n", err->message);
+
+          if (g_error_matches(err,
+                              VLOCK_AUTH_ERROR,
+                              VLOCK_AUTH_ERROR_FAILED)) {
+            fputs(auth_failure_blurb, stderr);
+            sleep(3);
+          }
+        }
+
+        g_clear_error(&err);
+        sleep(1);
+      }
+
+      auth_tries++;
+
+      /* 인증 실패 → 다시 LOCK 상태 */
+      state = STATE_LOCK;
+    }
+  }
+
+auth_success:
+  free(wait_timeout);
+  free(prompt_timeout);
+}
+
+static void auth_loop_org(const char *username)
 {
   GError *err = NULL;
   struct timespec *prompt_timeout;
@@ -95,8 +228,12 @@ static void auth_loop(const char *username)
     }
 
     /* Wait for enter or escape to be pressed. */
-    c = wait_for_character("\n\033", wait_timeout, NULL);
+    c = wait_for_character("\n\033\f", wait_timeout, NULL);
 
+    if (c == '\f') {
+      fputs("너 누구냐", stderr);
+        goto auth_prepare;
+	}
     /* Escape was pressed or the timeout occurred. */
     if (c == '\033' || c == 0) {
 #ifdef USE_PLUGINS
@@ -113,6 +250,7 @@ static void auth_loop(const char *username)
 #endif
     }
 
+auth_prepare:
     for (size_t i = 0; auth_names[i] != NULL; i++) {
       if (auth(auth_names[i], prompt_timeout, &err))
         goto auth_success;
